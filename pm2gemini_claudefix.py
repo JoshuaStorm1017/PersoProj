@@ -1,16 +1,21 @@
 import streamlit as st
 import pickle
 import os
+import json
+import base64
 from datetime import datetime, date
 import pandas as pd
 from dotenv import load_dotenv
+from io import BytesIO
 
 # --- Must be the first Streamlit command ---
 st.set_page_config(layout="wide")
 
 # --- Load environment variables and global configs ---
 load_dotenv()
-DATA_FILE = 'project_data_v2.pkl'
+# Use an absolute path with os.path.join for better path handling
+DATA_DIR = os.path.dirname(os.path.abspath(__file__))
+DATA_FILE = os.path.join(DATA_DIR, 'project_data_v2.pkl')
 APP_PASSWORD = os.environ.get("PROJECT_APP_PASSWORD")
 
 # --- Data Persistence and State Initialization Functions ---
@@ -29,28 +34,39 @@ def initialize_state():
     # Ensure app_initialized flag exists
     if 'app_initialized' not in st.session_state:
         st.session_state.app_initialized = False
+    # Add flag to track if data needs saving
+    if 'data_changed' not in st.session_state:
+        st.session_state.data_changed = False
 
 
 def save_data():
     """Save project data to a pickle file."""
-    print(f"DEBUG: Attempting to save data to {os.path.abspath(DATA_FILE)}...")
+    print(f"DEBUG: Attempting to save data to {DATA_FILE}...")
     # print(f"DEBUG: Data to be saved: {st.session_state.projects}") # Can be very verbose
     data_to_save = {
         'projects': st.session_state.projects,
         'next_project_id_num': st.session_state.next_project_id_num
     }
+    
+    # Ensure the directory exists
+    os.makedirs(os.path.dirname(DATA_FILE), exist_ok=True)
+    
     try:
         with open(DATA_FILE, 'wb') as f:
             pickle.dump(data_to_save, f)
         print(f"DEBUG: Data successfully saved to {DATA_FILE}")
-        st.toast(f"Data saved to {DATA_FILE}!", icon="💾")
+        st.toast(f"Data saved successfully!", icon="💾")
+        # Reset the data_changed flag after saving
+        st.session_state.data_changed = False
+        return True
     except Exception as e:
         print(f"DEBUG: ERROR SAVING DATA: {e}")
         st.error(f"Failed to save data: {e}")
+        return False
 
 def load_data():
     """Load project data from pickle file if it exists, then initialize state."""
-    print(f"DEBUG: Attempting to load data from {os.path.abspath(DATA_FILE)}...")
+    print(f"DEBUG: Attempting to load data from {DATA_FILE}...")
     if os.path.exists(DATA_FILE):
         try:
             with open(DATA_FILE, 'rb') as f:
@@ -58,26 +74,47 @@ def load_data():
                 st.session_state.projects = loaded_data.get('projects', {})
                 st.session_state.next_project_id_num = loaded_data.get('next_project_id_num', 1)
                 print(f"DEBUG: Data successfully loaded from {DATA_FILE}.")
-                # print(f"DEBUG: Loaded projects: {st.session_state.projects}") # Verbose
-                # print(f"DEBUG: Loaded next_project_id_num: {st.session_state.next_project_id_num}")
+                print(f"DEBUG: Loaded {len(st.session_state.projects)} projects.")
+                print(f"DEBUG: Next project ID: {st.session_state.next_project_id_num}")
+                
+                if st.session_state.projects:
+                    st.toast("Your project data has been loaded successfully!", icon="📊")
+                
+                return True
         except Exception as e:
             print(f"DEBUG: ERROR LOADING DATA from {DATA_FILE}: {e}. Initializing fresh state.")
             st.error(f"Error loading data file: {e}. Starting with a fresh state.")
             st.session_state.projects = {} # Ensure clean state on error
             st.session_state.next_project_id_num = 1
+            return False
     else:
         print(f"DEBUG: Data file {DATA_FILE} not found. Initializing fresh state.")
-    initialize_state() # Ensures all necessary session_state keys are present
+        return False
 
+# Function to mark data as changed and trigger auto-save
+def mark_data_changed():
+    """Mark data as changed to trigger auto-save."""
+    st.session_state.data_changed = True
+
+# Auto-save hook that runs on every rerun if data has changed
+def auto_save_if_needed():
+    """Automatically save data if it has been changed."""
+    if st.session_state.get('data_changed', False) and st.session_state.get('logged_in', False):
+        print("DEBUG: Auto-saving data because changes were detected...")
+        save_data()
 
 # --- Initial Data Load and State Setup (runs once per session) ---
 if not st.session_state.get('app_initialized', False):
-    load_data() # This calls initialize_state() at its end
+    initialize_state()
+    success = load_data()
+    if not success:
+        print("DEBUG: Initial data load failed or no data file exists.")
     st.session_state.app_initialized = True
 else:
     # On subsequent reruns, ensure core state keys exist
-    # This is a safeguard, initialize_state() is designed to be safe to call multiple times
     initialize_state()
+    # Try to auto-save if data has changed
+    auto_save_if_needed()
 
 
 # --- Password Protection and Login UI ---
@@ -94,7 +131,7 @@ def display_login_form():
     if st.button("Login", key="login_button_main_app"): # Unique key
         if password_attempt == APP_PASSWORD:
             st.session_state.logged_in = True
-            st.experimental_rerun() # Use experimental_rerun for cleaner state updates on login
+            st.rerun() # Use st.rerun() instead of deprecated experimental_rerun
         else:
             st.error("Incorrect password. Please try again.")
 
@@ -112,12 +149,29 @@ def run_main_app():
         key="navigation_page_main_app" # Unique key
     )
     st.sidebar.markdown("---")
-    if st.sidebar.button("Save All Data Manually"):
+    
+    # Display data file location and status
+    st.sidebar.markdown(f"**Data file location:**")
+    st.sidebar.code(DATA_FILE, language=None)
+    if os.path.exists(DATA_FILE):
+        file_size = os.path.getsize(DATA_FILE)
+        file_time = datetime.fromtimestamp(os.path.getmtime(DATA_FILE))
+        st.sidebar.markdown(f"**Last saved:** {file_time.strftime('%Y-%m-%d %H:%M:%S')}")
+        st.sidebar.markdown(f"**File size:** {file_size} bytes")
+    else:
+        st.sidebar.warning("No data file exists yet")
+    
+    # Manual save button (still useful despite auto-save)
+    if st.sidebar.button("Save All Data Now"):
         save_data()
+        
     if st.sidebar.button("Logout"):
         st.session_state.logged_in = False
         st.session_state.tasks_expanded = {} # Clear task expansion state on logout
-        st.experimental_rerun() # Rerun to go back to login screen
+        # Save data before logging out
+        if st.session_state.data_changed:
+            save_data()
+        st.rerun() # Use st.rerun() instead of deprecated experimental_rerun
 
     # Helper function for project display
     def get_project_display_name(project_id):
@@ -187,6 +241,9 @@ def run_main_app():
                         st.session_state.projects[project_id] = {
                             'name': project_name, 'description': project_description,
                             'created_date': datetime.now().strftime("%Y-%m-%d"), 'tasks': []}
+                        # Mark data as changed to trigger auto-save
+                        mark_data_changed()
+                        # Also save immediately
                         save_data()
                         st.success(f"Project '{project_name}' created successfully with ID: {project_id}")
                         st.balloons()
@@ -211,9 +268,12 @@ def run_main_app():
                             else:
                                 st.session_state.projects[project_to_edit_id]['name'] = edit_project_name
                                 st.session_state.projects[project_to_edit_id]['description'] = edit_project_description
+                                # Mark data as changed to trigger auto-save
+                                mark_data_changed()
+                                # Also save immediately
                                 save_data()
                                 st.success(f"Project '{edit_project_name}' updated successfully!")
-                                st.experimental_rerun()
+                                st.rerun()
         elif action == "Delete Project":
             st.subheader("Delete Project")
             if not st.session_state.projects: st.info("No projects to delete.")
@@ -228,9 +288,12 @@ def run_main_app():
                         del st.session_state.projects[project_to_delete_id]
                         keys_to_del = [k for k in st.session_state.tasks_expanded if k.startswith(project_to_delete_id)]
                         for k_del in keys_to_del: del st.session_state.tasks_expanded[k_del]
+                        # Mark data as changed to trigger auto-save
+                        mark_data_changed()
+                        # Also save immediately
                         save_data()
                         st.success(f"Project '{project_name_to_delete}' deleted successfully.")
-                        st.experimental_rerun()
+                        st.rerun()
 
     # --- Page: Manage Tasks ---
     elif page == "Manage Tasks":
@@ -269,7 +332,7 @@ def run_main_app():
                         with cols[3]:
                             if st.button("✏️" if not is_editing else "🔽", key=f"{task_key_prefix}_toggle_edit", help="Edit Task" if not is_editing else "Collapse Edit"):
                                 st.session_state.tasks_expanded[task_edit_state_key] = not is_editing
-                                st.experimental_rerun()
+                                st.rerun()
                         if is_editing:
                             with cols[4]:
                                 if st.button("💾", key=f"{task_key_prefix}_update", help="Save Task Changes"):
@@ -279,9 +342,12 @@ def run_main_app():
                                         project_val['tasks'][i]['due_date'] = new_due_date.strftime("%Y-%m-%d") if new_due_date else None
                                         project_val['tasks'][i]['status'] = new_status
                                         st.session_state.tasks_expanded[task_edit_state_key] = False
+                                        # Mark data as changed to trigger auto-save
+                                        mark_data_changed()
+                                        # Also save immediately
                                         save_data()
                                         st.success(f"Task '{new_name}' updated!")
-                                        st.experimental_rerun()
+                                        st.rerun()
                         else:
                             with cols[4]: st.empty()
                         with cols[5]:
@@ -289,9 +355,12 @@ def run_main_app():
                                 deleted_task_name = project_val['tasks'].pop(i)['name']
                                 if task_edit_state_key in st.session_state.tasks_expanded:
                                     del st.session_state.tasks_expanded[task_edit_state_key]
+                                # Mark data as changed to trigger auto-save
+                                mark_data_changed()
+                                # Also save immediately
                                 save_data()
                                 st.success(f"Task '{deleted_task_name}' deleted.")
-                                st.experimental_rerun()
+                                st.rerun()
                         st.divider()
                 else: st.info("No tasks for this project yet.")
 
@@ -308,14 +377,135 @@ def run_main_app():
                             project_val['tasks'].append({
                                 'name': task_name, 'due_date': task_due_date.strftime("%Y-%m-%d") if task_due_date else None,
                                 'status': task_status })
+                            # Mark data as changed to trigger auto-save
+                            mark_data_changed()
+                            # Also save immediately
                             save_data()
                             st.success(f"Task '{task_name}' added to '{project_val['name']}'!")
-                            st.experimental_rerun()
+                            
+
+    # --- Page: Data Backup/Restore ---
+    elif page == "Data Backup/Restore":
+        st.header("Data Backup & Restore")
+        
+        # Function to create a download link for a JSON file
+        def get_download_link(data, filename):
+            # Convert data to JSON string
+            json_str = json.dumps(data, indent=4)
+            # Encode to base64
+            b64 = base64.b64encode(json_str.encode()).decode()
+            href = f'<a href="data:application/json;base64,{b64}" download="{filename}">Download {filename}</a>'
+            return href
+        
+        # Export section
+        st.subheader("Export Data")
+        st.markdown("Save a backup of your project data as a JSON file. You can use this file to restore your data later.")
+        
+        # Format the data for export (same structure as used in save_data)
+        export_data = {
+            'projects': st.session_state.projects,
+            'next_project_id_num': st.session_state.next_project_id_num
+        }
+        
+        # Generate the download filename with a timestamp
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        download_filename = f"project_manager_backup_{timestamp}.json"
+        
+        # Create and display the download link
+        st.markdown(get_download_link(export_data, download_filename), unsafe_allow_html=True)
+        
+        # Import section
+        st.subheader("Import Data")
+        st.markdown("Restore your project data from a previously exported JSON file.")
+        st.warning("Importing data will replace all current projects and tasks. Make sure to export your current data first if you want to keep it.")
+        
+        uploaded_file = st.file_uploader("Choose a JSON backup file", type="json", key="json_uploader")
+        
+        if uploaded_file is not None:
+            # Read the JSON file
+            try:
+                content = uploaded_file.read()
+                import_data = json.loads(content)
+                
+                if st.button("Confirm Import"):
+                    try:
+                        # Validate the imported data
+                        if 'projects' not in import_data or 'next_project_id_num' not in import_data:
+                            st.error("Invalid backup file format. The file doesn't contain required data structures.")
+                        else:
+                            # Update the session state with the imported data
+                            st.session_state.projects = import_data['projects']
+                            st.session_state.next_project_id_num = import_data['next_project_id_num']
+                            
+                            # Mark data as changed and save immediately
+                            mark_data_changed()
+                            save_data()
+                            
+                            st.success("Data successfully imported and saved!")
+                            st.balloons()
+                    except Exception as e:
+                        st.error(f"Error importing data: {e}")
+            except json.JSONDecodeError:
+                st.error("Invalid JSON file. Please upload a valid JSON backup file.")
+            except Exception as e:
+                st.error(f"Error reading file: {e}")
+        
+        # Data migration utility
+        st.subheader("Data Migration & Recovery")
+        st.markdown("If you're experiencing issues with the pickle data file, you can convert your data to JSON format.")
+        
+        col1, col2 = st.columns(2)
+        
+        with col1:
+            if st.button("Save Current Data as JSON"):
+                try:
+                    # First ensure we save any pending changes to the pickle file
+                    if st.session_state.data_changed:
+                        save_data()
+                    
+                    # Save the current data to a JSON file
+                    json_data = {
+                        'projects': st.session_state.projects,
+                        'next_project_id_num': st.session_state.next_project_id_num
+                    }
+                    
+                    json_file = os.path.join(DATA_DIR, 'project_data_backup.json')
+                    with open(json_file, 'w') as f:
+                        json.dump(json_data, f, indent=4)
+                    
+                    st.success(f"Data successfully saved to JSON file: {json_file}")
+                except Exception as e:
+                    st.error(f"Error saving data to JSON: {e}")
+        
+        with col2:
+            if st.button("Load Data from JSON Backup"):
+                try:
+                    json_file = os.path.join(DATA_DIR, 'project_data_backup.json')
+                    
+                    if os.path.exists(json_file):
+                        with open(json_file, 'r') as f:
+                            json_data = json.load(f)
+                        
+                        if 'projects' in json_data and 'next_project_id_num' in json_data:
+                            st.session_state.projects = json_data['projects']
+                            st.session_state.next_project_id_num = json_data['next_project_id_num']
+                            
+                            # Save to the pickle file
+                            mark_data_changed()
+                            save_data()
+                            
+                            st.success("Data successfully loaded from JSON backup and saved!")
+                        else:
+                            st.error("Invalid JSON backup format.")
+                    else:
+                        st.error(f"JSON backup file not found: {json_file}")
+                except Exception as e:
+                    st.error(f"Error loading from JSON backup: {e}")
 
     # --- Footer ---
     st.markdown("---")
     st.markdown("Simple Project Manager - Personal Use Only")
-    st.caption(f"Data is saved locally to `{os.path.abspath(DATA_FILE)}`")
+    st.caption(f"Data is saved locally to `{DATA_FILE}`")
 
 
 # --- Gatekeeper: Decide whether to show login or main app ---
